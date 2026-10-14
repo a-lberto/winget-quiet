@@ -1,4 +1,3 @@
-# Save as .github/workflows/build-winget-quiet.yml in your own repo.
 # Builds microsoft/winget-cli with the "licensed to you by its owner" notice removed.
 name: Build quiet winget
 
@@ -56,16 +55,38 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Bootstrap vcpkg
+      # The steps below mirror winget-cli's own pipeline (azure-pipelines.nuget.yml).
+      - name: Enable vcpkg integration (runner's preinstalled vcpkg)
         shell: pwsh
         run: |
-          if (Test-Path vcpkg/bootstrap-vcpkg.bat) { ./vcpkg/bootstrap-vcpkg.bat -disableMetrics }
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" integrate install
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg integrate install failed" }
 
-      - name: Build
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore packages
         shell: pwsh
         run: |
-          msbuild src/AppInstallerCLI/AppInstallerCLI.vcxproj /restore /m `
-            /p:Configuration=Release /p:Platform=x64
+          function Run($exe, $argList) {
+            & $exe @argList
+            if ($LASTEXITCODE -ne 0) { throw "$exe $argList failed ($LASTEXITCODE)" }
+          }
+          # Solution restore covers the native (vcxproj) projects
+          Run nuget @("restore", "src/AppInstallerCLI.sln")
+          # UAP projects are skipped by the solution restore (NuGet/Home#7796)
+          Run nuget @("restore", "src/AppInstallerCLIPackage/AppInstallerCLIPackage.wapproj")
+          Run nuget @("restore", "src/AppInstallerTestMsixInstaller/AppInstallerTestMsixInstaller.wapproj")
+          # .NET projects (IndexCreationTool, LocalhostWebServer, ...)
+          Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
+            Run dotnet @("restore", $_.FullName)
+          }
+
+      - name: Build solution
+        shell: pwsh
+        run: |
+          # No /m: parallel projects race on vcpkg_installed\.solution-triplet
+          msbuild src/AppInstallerCLI.sln /p:Configuration=Release /p:Platform=x64
 
       - name: Collect output
         shell: pwsh
