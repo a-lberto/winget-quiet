@@ -1,0 +1,94 @@
+# Save as .github/workflows/build-winget-quiet.yml in your own repo.
+# Builds microsoft/winget-cli with the "licensed to you by its owner" notice removed.
+name: Build quiet winget
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "winget-cli tag or branch to build (e.g. v1.9.25200). Empty = latest release tag."
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 6 * * 1"   # weekly, rebuild the latest release
+
+permissions:
+  contents: write   # needed only for the release step
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Resolve ref
+        id: ref
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ref = "${{ inputs.ref }}"
+          if (-not $ref) {
+            $ref = gh api repos/microsoft/winget-cli/releases/latest --jq .tag_name
+          }
+          Write-Host "Building $ref"
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout winget-cli
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/winget-cli
+          ref: ${{ steps.ref.outputs.ref }}
+          submodules: recursive
+
+      - name: Remove license notice
+        shell: pwsh
+        run: |
+          $path = (Resolve-Path "src/AppInstallerCLICore/Workflows/InstallFlow.cpp").Path
+          $hasBom = (([IO.File]::ReadAllBytes($path))[0..2] -join ",") -eq "239,187,191"
+          $text = [IO.File]::ReadAllText($path)
+          $pattern = '[ \t]*context\.Reporter\.Info\(\)\s*<<\s*Resource::String::InstallationDisclaimer1\s*<<\s*std::endl\s*<<\s*Resource::String::InstallationDisclaimer2\s*<<\s*std::endl;[ \t]*\r?\n'
+          $count = [regex]::Matches($text, $pattern).Count
+          if ($count -ne 1) { throw "Expected exactly 1 notice statement in $path, found $count (code may have changed)." }
+          $new = [regex]::Replace($text, $pattern, "")
+          [IO.File]::WriteAllText($path, $new, [Text.UTF8Encoding]::new($hasBom))
+          git diff
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          if (Test-Path vcpkg/bootstrap-vcpkg.bat) { ./vcpkg/bootstrap-vcpkg.bat -disableMetrics }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          msbuild src/AppInstallerCLI/AppInstallerCLI.vcxproj /restore /m `
+            /p:Configuration=Release /p:Platform=x64
+
+      - name: Collect output
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem src -Recurse -Filter winget.exe |
+            Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
+          if (-not $exe) { throw "winget.exe not found after build." }
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item "$($exe.DirectoryName)\*" out -Recurse
+          Compress-Archive -Path out\* -DestinationPath winget-quiet-x64.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winget-quiet-x64
+          path: winget-quiet-x64.zip
+
+      - name: Publish release
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "winget-quiet-${{ steps.ref.outputs.ref }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload $tag winget-quiet-x64.zip --clobber }
+          else { gh release create $tag winget-quiet-x64.zip --title $tag --notes "winget ${{ steps.ref.outputs.ref }} without the license notice" }
