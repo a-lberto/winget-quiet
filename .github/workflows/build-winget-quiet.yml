@@ -164,6 +164,10 @@ jobs:
             }
           Copy-Item $dll.FullName out
           Get-ChildItem out -Recurse -File | Format-Table FullName, Length
+          # Without resources.pri winget prints raw string IDs instead of messages.
+          foreach ($required in "winget.exe", "WindowsPackageManager.dll", "resources.pri") {
+            if (-not (Test-Path (Join-Path out $required))) { throw "Required file missing from package: $required" }
+          }
           Compress-Archive -Path out\* -DestinationPath winget-quiet-x64.zip
 
       - name: Smoke test
