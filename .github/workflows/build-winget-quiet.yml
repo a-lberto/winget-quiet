@@ -56,7 +56,7 @@ jobs:
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      # The steps below mirror winget-cli's own pipeline (azure-pipelines.nuget.yml).
+      # The steps below mirror winget-cli's templates/jobs-build.yml.
       - name: Enable vcpkg integration (runner's preinstalled vcpkg)
         shell: pwsh
         run: |
@@ -73,15 +73,21 @@ jobs:
             & $exe @argList
             if ($LASTEXITCODE -ne 0) { throw "$exe $argList failed ($LASTEXITCODE)" }
           }
+          $cfg = "src/nuget.config"
           # Solution restore covers the native (vcxproj) projects
-          Run nuget @("restore", "src/AppInstallerCLI.sln")
-          # UAP projects are skipped by the solution restore (NuGet/Home#7796)
-          Run nuget @("restore", "src/AppInstallerCLIPackage/AppInstallerCLIPackage.wapproj")
-          Run nuget @("restore", "src/AppInstallerTestMsixInstaller/AppInstallerTestMsixInstaller.wapproj")
-          # .NET projects (IndexCreationTool, LocalhostWebServer, ...)
-          Get-ChildItem -Recurse -Filter *.csproj | ForEach-Object {
-            Run dotnet @("restore", $_.FullName)
+          Run nuget @("restore", "src/AppInstallerCLI.sln", "-ConfigFile", $cfg)
+          # UAP (wapproj) projects are skipped by the solution restore (NuGet/Home#7796)
+          Get-ChildItem src -Recurse -Filter *.wapproj | ForEach-Object {
+            Run nuget @("restore", $_.FullName, "-ConfigFile", $cfg)
           }
+          # .NET projects (IndexCreationTool, LocalhostWebServer, ...)
+          Get-ChildItem src -Recurse -Filter *.csproj | ForEach-Object {
+            Run dotnet @("restore", $_.FullName, "--configfile", $cfg)
+          }
+
+      - name: Disk space before build
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{N="UsedGB";E={[math]::Round($_.Used/1GB,2)}}, @{N="FreeGB";E={[math]::Round($_.Free/1GB,2)}}
 
       - name: Build solution
         shell: pwsh
@@ -90,8 +96,28 @@ jobs:
           # cl.exe picks extra options up from the CL environment variable.
           CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: |
-          # No /m: parallel projects race on vcpkg_installed\.solution-triplet
-          msbuild src/AppInstallerCLI.sln /p:Configuration=Release /p:Platform=x64
+          # Same MSBuild arguments as upstream's Build Solution step
+          msbuild src/AppInstallerCLI.sln /m /bl:msbuild.binlog `
+            /p:Configuration=Release /p:Platform=x64 `
+            /p:AppxBundlePlatforms=x64 `
+            /p:AppxPackageDir=$env:RUNNER_TEMP\AppxPackages `
+            /p:AppxBundle=Always `
+            /p:UapAppxPackageBuildMode=SideloadOnly `
+            /p:PreferredToolArchitecture=x64 `
+            /p:WingetDisableIncrementalLinkTimeCodeGeneration=true
+
+      - name: Disk space after build
+        if: always()
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{N="UsedGB";E={[math]::Round($_.Used/1GB,2)}}, @{N="FreeGB";E={[math]::Round($_.Free/1GB,2)}}
+
+      - name: Upload MSBuild binary log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msbuild-binlog
+          path: msbuild.binlog
+          if-no-files-found: ignore
 
       - name: Collect output
         shell: pwsh
@@ -103,10 +129,25 @@ jobs:
           Copy-Item "$($exe.DirectoryName)\*" out -Recurse
           Compress-Archive -Path out\* -DestinationPath winget-quiet-x64.zip
 
+      # Upstream builds a registrable package layout from the appxrecipe. Optional here:
+      # it should give a copy that runs with package identity, but it is untested.
+      - name: Create package layout (optional)
+        continue-on-error: true
+        shell: pwsh
+        working-directory: src
+        run: |
+          $layout = Join-Path $env:GITHUB_WORKSPACE "layout"
+          ./AppInstallerCLIPackage/Execute-AppxRecipe.ps1 `
+            -AppxRecipePath AppInstallerCLIPackage\bin\x64\Release\AppInstallerCLIPackage.build.appxrecipe `
+            -LayoutPath $layout -Force -Verbose
+          Compress-Archive -Path "$layout\*" -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "winget-quiet-layout-x64.zip")
+
       - uses: actions/upload-artifact@v4
         with:
           name: winget-quiet-x64
-          path: winget-quiet-x64.zip
+          path: |
+            winget-quiet-x64.zip
+            winget-quiet-layout-x64.zip
 
       - name: Publish release
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
