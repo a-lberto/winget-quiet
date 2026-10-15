@@ -143,29 +143,40 @@ jobs:
           $exe = Get-ChildItem src -Recurse -Filter winget.exe |
             Where-Object { $_.FullName -match "Release" } | Select-Object -First 1
           if (-not $exe) { throw "winget.exe not found after build." }
+          # winget.exe loads WindowsPackageManager.dll, which is built by a separate
+          # project into its own output folder.
+          $dll = Get-ChildItem src -Recurse -Filter WindowsPackageManager.dll |
+            Where-Object { $_.FullName -match "x64\\Release\\WindowsPackageManager\\" } | Select-Object -First 1
+          if (-not $dll) { throw "WindowsPackageManager.dll not found after build." }
+          Write-Host "winget.exe from: $($exe.FullName)"
+          Write-Host "dll from:        $($dll.FullName)"
+
+          # Stage runtime files only: drop debug symbols and linker/compiler leftovers.
+          $junk = '.pdb','.lib','.exp','.ilk','.obj','.iobj','.ipdb','.log','.tlog'
+          $root = $exe.DirectoryName
           New-Item -ItemType Directory -Force out | Out-Null
-          Copy-Item "$($exe.DirectoryName)\*" out -Recurse
+          Get-ChildItem $root -Recurse -File |
+            Where-Object { $junk -notcontains $_.Extension.ToLower() } |
+            ForEach-Object {
+              $target = Join-Path (Resolve-Path out).Path $_.FullName.Substring($root.Length).TrimStart('\')
+              New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+              Copy-Item $_.FullName $target
+            }
+          Copy-Item $dll.FullName out
+          Get-ChildItem out -Recurse -File | Format-Table FullName, Length
           Compress-Archive -Path out\* -DestinationPath winget-quiet-x64.zip
 
-      # Upstream builds a registrable package layout from the appxrecipe. Optional here:
-      # it should give a copy that runs with package identity, but it is untested.
-      - name: Create package layout (optional)
-        continue-on-error: true
+      - name: Smoke test
         shell: pwsh
-        working-directory: src
         run: |
-          $layout = Join-Path $env:GITHUB_WORKSPACE "layout"
-          ./AppInstallerCLIPackage/Execute-AppxRecipe.ps1 `
-            -AppxRecipePath AppInstallerCLIPackage\bin\x64\Release\AppInstallerCLIPackage.build.appxrecipe `
-            -LayoutPath $layout -Force -Verbose
-          Compress-Archive -Path "$layout\*" -DestinationPath (Join-Path $env:GITHUB_WORKSPACE "winget-quiet-layout-x64.zip")
+          & .\out\winget.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "winget.exe failed to run ($LASTEXITCODE)" }
 
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: winget-quiet-x64
-          path: |
-            winget-quiet-x64.zip
-            winget-quiet-layout-x64.zip
+          path: winget-quiet-x64.zip
 
       - name: Publish release
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
