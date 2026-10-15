@@ -1,3 +1,4 @@
+# Save as .github/workflows/build-winget-quiet.yml in your own repo.
 # Builds microsoft/winget-cli with the "licensed to you by its owner" notice removed.
 name: Build quiet winget
 
@@ -84,6 +85,10 @@ jobs:
 
       - name: Build solution
         shell: pwsh
+        env:
+          # MSVC 14.51 (VS 18) makes the deprecated /await header a hard error (STL1011).
+          # cl.exe picks extra options up from the CL environment variable.
+          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: |
           # No /m: parallel projects race on vcpkg_installed\.solution-triplet
           msbuild src/AppInstallerCLI.sln /p:Configuration=Release /p:Platform=x64
