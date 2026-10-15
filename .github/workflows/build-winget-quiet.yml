@@ -85,16 +85,34 @@ jobs:
             Run dotnet @("restore", $_.FullName, "--configfile", $cfg)
           }
 
+      # MSVC 14.51 (VS 18) makes the deprecated /await header a hard error (STL1011).
+      # Put the silencing define straight into every project's compiler options.
+      - name: Silence experimental coroutine deprecation (STL1011)
+        shell: pwsh
+        run: |
+          $define = "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
+          $patched = 0
+          Get-ChildItem src -Recurse -Filter *.vcxproj | ForEach-Object {
+            $path = $_.FullName
+            $hasBom = (([IO.File]::ReadAllBytes($path))[0..2] -join ",") -eq "239,187,191"
+            $text = [IO.File]::ReadAllText($path)
+            if ($text.Contains($define)) { return }
+            $new = $text.Replace("<PreprocessorDefinitions>", "<PreprocessorDefinitions>$define;")
+            if ($new -ne $text) {
+              [IO.File]::WriteAllText($path, $new, [Text.UTF8Encoding]::new($hasBom))
+              $patched++
+            }
+          }
+          Write-Host "Patched $patched vcxproj files"
+          if ($patched -eq 0) { throw "No PreprocessorDefinitions found to patch." }
+          git diff --stat
+
       - name: Disk space before build
         shell: pwsh
         run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{N="UsedGB";E={[math]::Round($_.Used/1GB,2)}}, @{N="FreeGB";E={[math]::Round($_.Free/1GB,2)}}
 
       - name: Build solution
         shell: pwsh
-        env:
-          # MSVC 14.51 (VS 18) makes the deprecated /await header a hard error (STL1011).
-          # cl.exe picks extra options up from the CL environment variable.
-          CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
         run: |
           # Same MSBuild arguments as upstream's Build Solution step
           msbuild src/AppInstallerCLI.sln /m /bl:msbuild.binlog `
@@ -155,7 +173,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The working directory is a clone of microsoft/winget-cli, so gh must be told
+          # explicitly to use THIS repository instead of the clone's remote.
+          $repo = "${{ github.repository }}"
           $tag = "winget-quiet-${{ steps.ref.outputs.ref }}"
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) { gh release upload $tag winget-quiet-x64.zip --clobber }
-          else { gh release create $tag winget-quiet-x64.zip --title $tag --notes "winget ${{ steps.ref.outputs.ref }} without the license notice" }
+          gh release view $tag --repo $repo 2>$null
+          if ($LASTEXITCODE -eq 0) { gh release upload $tag winget-quiet-x64.zip --clobber --repo $repo }
+          else { gh release create $tag winget-quiet-x64.zip --repo $repo --title $tag --notes "winget ${{ steps.ref.outputs.ref }} without the license notice" }
+          if ($LASTEXITCODE -ne 0) { throw "gh release failed ($LASTEXITCODE)" }
